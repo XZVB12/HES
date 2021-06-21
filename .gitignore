@@ -1,3 +1,8 @@
-server
+client_*_*
+server_*_*
+client.db
+server.db
 client
-database.db
+server
+compile
+*.exe

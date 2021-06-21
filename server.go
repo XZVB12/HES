@@ -1,59 +1,86 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	gp "github.com/number571/gopeer"
 	"net/http"
-	"strconv"
-)
-
-const (
-	MAXSIZE = 32 * (1 << 20) // 32MiB
+	"time"
 )
 
 var (
-	DBptr *DB
+	DATABASE = NewDB("server.db")
+	FLCONFIG = NewCFG("server.cfg")
 )
 
 func init() {
-	DBptr = DBInit("database.db")
-	if DBptr == nil {
-		panic("error: database init")
+	go delOldEmailsByTime(24*time.Hour, 6*time.Hour)
+	hesDefaultInit("localhost:8080")
+	fmt.Printf("Server is listening [%s] ...\n\n", OPENADDR)
+}
+
+func delOldEmailsByTime(deltime, period time.Duration) {
+	for {
+		DATABASE.DelEmailsByTime(deltime)
+		time.Sleep(period)
 	}
-	fmt.Println("Server is listening...\n")
 }
 
 func main() {
-	addrPtr := flag.String("address", "", "address of hidden email server")
-	flag.Parse()
-	if *addrPtr == "" {
-		fmt.Println("error: address is nil")
-		return
-	}
 	http.HandleFunc("/", indexPage)
-	http.HandleFunc("/send", emailSendPage)
-	http.HandleFunc("/recv", emailRecvPage)
-	http.ListenAndServe(*addrPtr, nil)
+	http.HandleFunc("/email/send", emailSendPage)
+	http.HandleFunc("/email/recv", emailRecvPage)
+	http.ListenAndServe(OPENADDR, nil)
+}
+
+func help() string {
+	return `
+1. exit   - close server;
+2. help   - commands info;
+3. list   - list connections;
+4. append - append connect to list;
+5. delete - delete connect from list;
+`
 }
 
 func indexPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	response(w, 0, "(HES) Hidden email service. Gopeer based.")
+	var req struct {
+		Macp string `json:"macp"`
+	}
+	if r.Method != "POST" {
+		response(w, 0, "hidden email service")
+		return
+	}
+	if r.ContentLength > int64(MAXESIZE) {
+		response(w, 1, "error: max size")
+		return
+	}
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		response(w, 2, "error: parse json")
+		return
+	}
+	pasw := gp.HashSum([]byte(FLCONFIG.Pasw))
+	dect := gp.DecryptAES(pasw, gp.Base64Decode(req.Macp))
+	if !bytes.Equal([]byte(TMESSAGE), dect) {
+		response(w, 3, "error: message authentication code")
+		return
+	}
+	response(w, 0, "success: check connection")
 }
 
 func emailSendPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	var req struct {
 		Recv string `json:"recv"`
 		Data string `json:"data"`
+		Macp string `json:"macp"`
 	}
 	if r.Method != "POST" {
 		response(w, 1, "error: method != POST")
 		return
 	}
-	if r.ContentLength > MAXSIZE {
+	if r.ContentLength > int64(MAXESIZE) {
 		response(w, 2, "error: max size")
 		return
 	}
@@ -62,36 +89,56 @@ func emailSendPage(w http.ResponseWriter, r *http.Request) {
 		response(w, 3, "error: parse json")
 		return
 	}
-	pack := gp.DeserializePackage(req.Data)
+	pack := gp.DeserializePackage([]byte(req.Data))
 	if pack == nil {
 		response(w, 4, "error: deserialize package")
 		return
 	}
-	hash := gp.Base64Decode(pack.Body.Hash)
-	powd := gp.Get("POWS_DIFF").(uint)
-	if !gp.ProofIsValid(hash, powd, pack.Body.Npow) {
+	hash := pack.Body.Hash
+	if !gp.ProofIsValid(hash, POWSDIFF, pack.Body.Npow) {
 		response(w, 5, "error: proof of work")
 		return
 	}
-	err = DBptr.SetEmail(req.Recv, pack.Body.Hash, req.Data)
-	if err != nil {
-		response(w, 6, "error: save email")
+	pasw := gp.HashSum([]byte(FLCONFIG.Pasw))
+	dech := gp.DecryptAES(pasw, gp.Base64Decode(req.Macp))
+	if !bytes.Equal(hash, dech) {
+		response(w, 6, "error: message authentication code")
 		return
+	}
+	err = DATABASE.SetEmail(req.Recv, pack)
+	if err != nil {
+		response(w, 7, "error: save email")
+		return
+	}
+	for _, conn := range FLCONFIG.Conns {
+		go func() {
+			addr := conn[0]
+			pasw := gp.HashSum([]byte(conn[1]))
+			req.Macp = gp.Base64Encode(gp.EncryptAES(pasw, hash))
+			resp, err := HTCLIENT.Post(
+				addr+"/email/send",
+				"application/json",
+				bytes.NewReader(serialize(req)),
+			)
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+		}()
 	}
 	response(w, 0, "success: email saved")
 }
 
 func emailRecvPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	var req struct {
 		Recv string `json:"recv"`
-		Mode string `json:"mode"`
+		Data int    `json:"data"`
 	}
 	if r.Method != "POST" {
 		response(w, 1, "error: method != POST")
 		return
 	}
-	if r.ContentLength > MAXSIZE {
+	if r.ContentLength > int64(MAXESIZE) {
 		response(w, 2, "error: max size")
 		return
 	}
@@ -100,28 +147,20 @@ func emailRecvPage(w http.ResponseWriter, r *http.Request) {
 		response(w, 3, "error: parse json")
 		return
 	}
-	switch req.Mode {
-	case "size":
-		response(w, 0, fmt.Sprintf("%d", DBptr.Size(req.Recv)))
-		return
-	default:
-		num, err := strconv.Atoi(req.Mode)
-		if err != nil {
-			response(w, 4, "error: parse int")
-			return
-		}
-		res := DBptr.GetEmail(num, req.Recv)
-		if res == "" {
-			response(w, 5, "error: nothing data")
-			return
-		}
-		response(w, 0, res)
+	if req.Data == 0 {
+		response(w, 0, fmt.Sprintf("%d", DATABASE.Size(req.Recv)))
 		return
 	}
-	response(w, 6, "error: mode undefined")
+	res := DATABASE.GetEmail(req.Data, req.Recv)
+	if res == "" {
+		response(w, 4, "error: nothing data")
+		return
+	}
+	response(w, 0, res)
 }
 
 func response(w http.ResponseWriter, ret int, res string) {
+	w.Header().Set("Content-Type", "application/json")
 	var resp struct {
 		Result string `json:"result"`
 		Return int    `json:"return"`
